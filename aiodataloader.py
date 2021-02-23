@@ -1,33 +1,42 @@
-from asyncio import gather, ensure_future, get_event_loop, iscoroutine, iscoroutinefunction
+from asyncio import gather, ensure_future, get_event_loop, iscoroutine, iscoroutinefunction, AbstractEventLoop, Future
 from collections import namedtuple
 from collections.abc import Iterable
 from functools import partial
 
-from typing import List  # flake8: noqa
-
+from typing import List, Optional, Callable, Any, Coroutine, Dict, TypeVar, Generic, Union, Generator  # flake8: noqa
 
 __version__ = '0.2.0'
 
 Loader = namedtuple('Loader', 'key,future')
 
+IN = TypeVar('IN')
+OUT = TypeVar('OUT')
+K = TypeVar('K')
 
-def iscoroutinefunctionorpartial(fn):
+
+def iscoroutinefunctionorpartial(fn: Any) -> bool:
     return iscoroutinefunction(fn.func if isinstance(fn, partial) else fn)
 
 
-class DataLoader(object):
+class DataLoader(Generic[IN, OUT, K]):
 
-    batch = True
-    max_batch_size = None  # type: int
-    cache = True
+    batch: bool = True
+    max_batch_size: Optional[int] = None
+    cache: bool = True
 
-    def __init__(self, batch_load_fn=None, batch=None, max_batch_size=None,
-                 cache=None, get_cache_key=None, cache_map=None, loop=None):
+    def __init__(self,
+                 batch_load_fn: Optional[Callable[[List[IN]], Coroutine[Any, Any, List[OUT]]]] = None,
+                 batch: Optional[bool] = None,
+                 max_batch_size: Optional[int] = None,
+                 cache: Optional[bool] = None,
+                 get_cache_key: Callable[[IN], K] = None,
+                 cache_map=None,
+                 loop: Optional[AbstractEventLoop] = None) -> None:
 
-        self.loop = loop or get_event_loop()
+        self.loop: AbstractEventLoop = loop or get_event_loop()
 
         if batch_load_fn is not None:
-            self.batch_load_fn = batch_load_fn
+            self.batch_load_fn: Callable[[List[IN]], Coroutine[Any, Any, List[OUT]]] = batch_load_fn
 
         assert iscoroutinefunctionorpartial(self.batch_load_fn), "batch_load_fn must be coroutine. Received: {}".format(
             self.batch_load_fn)
@@ -47,12 +56,12 @@ class DataLoader(object):
         if cache is not None:
             self.cache = cache
 
-        self.get_cache_key = get_cache_key or (lambda x: x)
+        self.get_cache_key: Callable[[IN], K] = get_cache_key or (lambda x: x)
 
-        self._cache = cache_map if cache_map is not None else {}
-        self._queue = []  # type: List[Loader]
+        self._cache: Dict[K, Future[OUT]] = cache_map if cache_map is not None else {}
+        self._queue: List[Loader] = []
 
-    def load(self, key=None):
+    def load(self, key: Optional[IN] = None) -> Future[OUT]:
         """
         Loads a key, returning a `Future` for the value represented by that key.
         """
@@ -79,7 +88,7 @@ class DataLoader(object):
         self.do_resolve_reject(key, future)
         return future
 
-    def do_resolve_reject(self, key, future):
+    def do_resolve_reject(self, key: IN, future: Future[OUT]):
         # Enqueue this Future to be dispatched.
         self._queue.append(Loader(
             key=key,
@@ -96,7 +105,7 @@ class DataLoader(object):
                 # Otherwise dispatch the (queue of one) immediately.
                 dispatch_queue(self)
 
-    def load_many(self, keys):
+    def load_many(self, keys: Iterable[IN]) -> Any:
         """
         Loads multiple keys, returning a list of values
 
@@ -117,7 +126,7 @@ class DataLoader(object):
 
         return gather(*[self.load(key) for key in keys])
 
-    def clear(self, key):
+    def clear(self, key: IN) -> 'DataLoader':
         """
         Clears the value at `key` from the cache, if it exists. Returns itself for
         method chaining.
@@ -126,7 +135,7 @@ class DataLoader(object):
         self._cache.pop(cache_key, None)
         return self
 
-    def clear_all(self):
+    def clear_all(self) -> 'DataLoader':
         """
         Clears the entire cache. To be used when some event results in unknown
         invalidations across this particular `DataLoader`. Returns itself for
@@ -135,7 +144,7 @@ class DataLoader(object):
         self._cache.clear()
         return self
 
-    def prime(self, key, value):
+    def prime(self, key: IN, value: Union[OUT, Exception]) -> 'DataLoader':
         """
         Adds the provied key and value to the cache. If the key already exists, no
         change is made. Returns itself for method chaining.
@@ -157,18 +166,19 @@ class DataLoader(object):
         return self
 
 
-def enqueue_post_future_job(loop, loader):
-    async def dispatch():
+def enqueue_post_future_job(loop: AbstractEventLoop, loader: DataLoader) -> None:
+    async def dispatch() -> None:
         dispatch_queue(loader)
+
     loop.call_soon(ensure_future, dispatch())
 
 
-def get_chunks(iterable_obj, chunk_size=1):
+def get_chunks(iterable_obj: List, chunk_size=1) -> Generator:
     chunk_size = max(1, chunk_size)
     return (iterable_obj[i:i + chunk_size] for i in range(0, len(iterable_obj), chunk_size))
 
 
-def dispatch_queue(loader):
+def dispatch_queue(loader: DataLoader) -> None:
     """
     Given the current state of a Loader instance, perform a batch load
     from its current queue.
@@ -192,7 +202,7 @@ def dispatch_queue(loader):
         ensure_future(dispatch_queue_batch(loader, queue))
 
 
-async def dispatch_queue_batch(loader, queue):
+async def dispatch_queue_batch(loader: DataLoader, queue: List[Loader]) -> None:
     # Collect all keys to be loaded in this dispatch
     keys = [l.key for l in queue]
 
@@ -243,7 +253,7 @@ async def dispatch_queue_batch(loader, queue):
         return failed_dispatch(loader, queue, e)
 
 
-def failed_dispatch(loader, queue, error):
+def failed_dispatch(loader: DataLoader, queue: List[Loader], error: Exception) -> None:
     """
     Do not cache individual loads if the entire batch dispatch fails,
     but still reject each request so they do not hang.
